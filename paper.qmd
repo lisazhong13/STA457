@@ -1,0 +1,1123 @@
+---
+title: "\\LARGE Forecasting Cocoa Price Using Time Series Models"
+author: "Yuna Hu, Jianing Li, Jiayi Ma, Jingwen Zhong"
+format:
+  pdf:
+    fig-cap-location: bottom
+    fig-cap-style: plain
+    keep-tex: true
+    number-sections: true
+    toc: FALSE
+    include-in-header: caption-fontsize.tex
+bibliography: references.bib
+---
+<style type="text/css">
+  body{
+  font-size: 12pt;
+  }
+</style>
+
+```{r}
+#| include: false
+#| warning: false
+#| message: false
+# Load libraries
+library(astsa)
+library(tidyverse)
+library(lubridate)
+library(forecast)
+library(tseries)
+library(caret)
+library(car)
+library(rugarch)  # for GARCH
+library(reshape2)
+library(scales)
+library(zoo)
+library(knitr)
+library(moments)
+library(xts)
+library(ggplot2)
+library(FinTS)
+library(gridExtra)
+library(patchwork)
+library(dplyr)
+```
+
+```{r}
+#| include: false
+#| warning: false
+#| message: false
+
+# Load cocoa price data
+cocoa_prices <- read.csv("Daily Prices_ICCO.csv", stringsAsFactors = FALSE)
+cocoa_prices$Date <- as.Date(cocoa_prices$Date, format='%d/%m/%Y')
+cocoa_prices$Price <- as.numeric(gsub(",", "", cocoa_prices$ICCO.daily.price..US..tonne.))
+cocoa_prices <- cocoa_prices %>% select(Date, Price) %>% arrange(Date)
+
+# Convert to monthly price
+cocoa_prices <- cocoa_prices %>%
+  mutate(YearMonth = floor_date(Date, "month")) %>%
+  group_by(YearMonth) %>%
+  summarise(Price = mean(Price, na.rm = TRUE))
+
+# Load Ghana weather data
+ghana_weather <- read.csv("Ghana_data.csv", stringsAsFactors = FALSE)
+ghana_weather$DATE <- as.Date(ghana_weather$DATE)
+
+# Clean the dataset
+ghana_weather <- ghana_weather %>%
+  mutate(
+    Date = ymd(DATE),                   
+    PRCP = replace_na(as.numeric(PRCP), 0),           
+    TAVG = as.numeric(TAVG),
+    TMAX = as.numeric(TMAX),
+    TMIN = as.numeric(TMIN)
+  ) %>%
+  select(Date, PRCP, TAVG, TMAX, TMIN)  # Drop junk columns
+
+# Import Ghana climate data
+ghana25 <- read_csv("ghana_data_24-25.csv", show_col_types = FALSE)
+ghana25$Date <- as.Date(ghana25$Date)
+ghana25 <- ghana25 %>%
+  mutate(
+    Date = ymd(Date),  # Convert to Date format
+    PRCP = replace_na(as.numeric(`PRCP (Inches)`), 0),
+    TAVG = as.numeric(`TAVG (Degrees Fahrenheit)`),
+    TMAX = as.numeric(`TMAX (Degrees Fahrenheit)`),
+    TMIN = as.numeric(`TMIN (Degrees Fahrenheit)`)
+  ) %>%
+  select(Date, PRCP, TAVG, TMAX, TMIN)
+
+# Store the latest date in ghana
+latest_ghana_date <- max(ghana_weather$Date, na.rm = TRUE)
+
+# Filter ghana25 to only keep rows with Date after that
+ghana25_filtered <- ghana25[ghana25$Date > latest_ghana_date, ]
+ghana_weather <- bind_rows(ghana_weather, ghana25_filtered)
+
+# Sort by date to keep it chronological
+ghana_weather <- ghana_weather %>% arrange(Date)
+# convert to monthly weather
+ghana_weather <- ghana_weather %>%
+  mutate(YearMonth = floor_date(Date, "month")) %>%
+  group_by(YearMonth) %>%
+  summarise(
+    TAVG = mean(TAVG, na.rm = TRUE),
+    PRCP = sum(PRCP, na.rm = TRUE)
+  )
+
+# Import currency exchange data
+currency <- read_csv("USD_GHS.csv", show_col_types = FALSE)
+
+currency <- currency %>%
+  mutate(Date = mdy(Date),
+         currency = Price) %>%
+  select(Date, currency)
+
+# Convert to monthly currency
+currency <- currency %>%
+  mutate(YearMonth = format(Date, "%Y-%m")) %>%
+  group_by(YearMonth) %>%
+  summarise(currency = mean(currency, na.rm = TRUE))
+```
+
+```{r}
+#| include: false
+#| warning: false
+#| message: false
+
+# Standardize all YearMonth to Date format: "YYYY-MM-01"
+cocoa_prices <- cocoa_prices %>%
+  mutate(YearMonth = as.Date(paste0(format(YearMonth, "%Y-%m"), "-01"))) %>%
+  distinct(YearMonth, .keep_all = TRUE)
+
+ghana_weather <- ghana_weather %>%
+  mutate(YearMonth = as.Date(paste0(format(YearMonth, "%Y-%m"), "-01"))) %>%
+  distinct(YearMonth, .keep_all = TRUE)
+
+currency <- currency %>%
+  mutate(YearMonth = as.Date(paste0(YearMonth, "-01"))) %>%
+  distinct(YearMonth, .keep_all = TRUE)
+
+# Now safely join
+cocoa_data <- cocoa_prices %>%
+  left_join(currency, by = "YearMonth") %>%
+  left_join(ghana_weather, by = "YearMonth")
+```
+
+```{r}
+#| include: false
+#| warning: false
+#| message: false
+
+# Log Transformation and Differencing
+cocoa_data <- cocoa_data %>%
+  mutate(
+    logPrice = log(Price+1),  # Log transform to stabilize variance
+    difflogPrice = c(NA, diff(logPrice)),  # First differencing
+    logcurrency = log(currency+1),  # Log transform to stabilize variance
+    difflogcurrency = c(NA, diff(logcurrency)),  # First differencing
+    logPRCP = log(PRCP+1),  # Log transform to stabilize variance
+    difflogPRCP = c(NA, diff(logPRCP)),  # First differencing
+    diff2logPRCP = c(NA, NA, diff(diff(logPRCP))),
+    logTAVG = log(TAVG+1),  # Log transform to stabilize variance
+    difflogTAVG = c(NA, diff(logTAVG))  # First differencing
+  )
+# Drop rows with NA in difflogPrice column
+cocoa_data <- cocoa_data %>% drop_na(difflogPrice)
+cocoa_data <- cocoa_data %>% drop_na(difflogcurrency)
+cocoa_data <- cocoa_data %>% drop_na(difflogPRCP)
+cocoa_data <- cocoa_data %>% drop_na(difflogTAVG)
+```
+
+```{r}
+#| include: false
+#| warning: false
+#| message: false
+# Total number of observations
+n <- nrow(cocoa_data)
+
+# Split index: last four months for testing
+split_index <- n - 4
+
+# Create training and test data
+train_data <- cocoa_data[1:split_index, ]
+test_data <- cocoa_data[(split_index + 1):n, ]
+
+# Training time series
+ts_train <- xts(train_data$Price, order.by = as.Date(paste0(train_data$YearMonth, "-01")))
+
+# Test time series
+ts_test <- xts(test_data$Price, order.by = as.Date(paste0(test_data$YearMonth, "-01")))
+```
+
+# Introduction
+
+Commodity price forecasting is a key task in financial and agricultural decision-making. Among these commodities, cocoa plays a particularly important role due to its widespread use in the global chocolate industry. As a result, the study of cocoa prices has attracted significant attention. The price of cocoa is highly volatile, influenced by a combination of climatic, economic, and regional factors. In recent years, this volatility has intensified, with global cocoa prices experiencing a dramatic surge. A key challenge in modeling cocoa prices lies in capturing their nonstationary behavior and seasonal patterns. These characteristics make it difficult to develop stable and generalizable predictive models. Moreover, recent literature suggests that cocoa price dynamics are not solely driven by internal temporal dependencies, but are also significantly affected by external macroeconomic and environmental conditions.
+
+The objective of this project is to develop a reliable forecasting framework for monthly cocoa futures prices by combining traditional time series models with external factor analysis, with the aim of supporting chocolate manufacturers in making more informed decisions regarding production and marketing strategies. Specifically, we examine the performance of ETS, ARIMA, SARIMA, and ARIMA-GARCH models using daily price data from the International Cocoa Organization (ICCO), spanning from 1994 to early 2025. To evaluate the added value of external information, we incorporate climate indicators, average temperature and precipitation, and the USD/GHS exchange rate, all aggregated to monthly frequency.
+
+The selected covariates are motivated by prior research. Donkor et al. identified statistically significant relationships between climate variables and cocoa futures prices [@donkoreffect]. Similarly, Poku (2017) found that lagged exchange rate changes positively influenced domestic cocoa prices in Ghana [@poku2017influence]. These studies provide a foundation for the inclusion of climate and macroeconomic indicators in our extended forecasting models. To identify the most effective forecasting strategy, the analysis compares the performance of univariate models and models incorporating external covariates, highlighting the tradeoffs between model complexity, interpretability, and predictive accuracy in the context of commodity markets.
+
+# Literature Review
+
+Time series models are commonly applied in the analysis of commodity prices, particularly in agricultural market. Assis et al. (2010) evaluated several univariate time series models, including ARIMA, ETS, GARCH, and ARIMA-GARCH, to forecast cocoa bean prices in Malaysia. Their results indicated that the GARCH(1,1) model provided superior performance in capturing volatility patterns [@assis2010forecasting]. This demonstrates the effectiveness of univariate models in forecasting price movements, even in the absence of external variables.
+
+In a different context, Ankrah et al. (2014) examined the relationship between world cocoa prices and cocoa production in Ghana using a regression model with ARIMA(2,2,0) errors. Their findings showed that incorporating external predictors and accounting for autocorrelated residuals significantly improved forecasting accuracy compared to a standard ARIMA model [@ankrah2014modeling]. This approach highlights the value of combining regression analysis with time series techniques when external factors play a significant role.
+
+The present study builds on both of these approaches. Initially, we implement several traditional time series models—such as ETS, ARIMA, SARIMA, and GARCH—using only historical price data. Subsequently, we extend the modeling framework by incorporating external covariates within a regression structure with time series errors. In doing so, we aim to evaluate the added predictive value of relevant external information.
+
+# Methodology
+
+In order to model and forecast monthly cocoa futures prices, this project employs a two-stage modeling strategy. The first stage focuses on a classical univariate time series model, while the second stage incorporates exogenous variables into the modeling framework in order to assess whether external information contributes to forecasting accuracy.
+
+## Data Processing
+
+The datasets are collected from three sources: ICCO daily cocoa prices, Ghanaian weather records, and USD/GHS currency exchange rates. The Ghanaian weather data is compiled from two sources: historical records (1990-2024) and recent updates (2024-2025). Since precipitation (`PRCP`) values are recorded as blank when equal to zero, we replace all blank PRCP observations with zero.
+
+All three datasets are initially recorded on a daily basis. Due to the high-frequency fluctuations inherent in daily data, direct modeling could obscure the long-term price structure. To better capture trends and seasonal variations, we aggregate the data to a monthly frequency by calculating the mean of each variable per month. Then, any monthly observations with missing values are removed to avoid biases and inaccuracies when fitting models.
+
+Finally, we complete data preprocessing by splitting the data into training and test data, the latter containing the last four monthly observations because our goal is to use the historical data to predict the most recent cocoa price. The training data are used to fit the model, and the test data are used to test the accuracy of the model.
+
+## Classic Univariate Time Series Modeling
+We start with an ETS model due to its simplicity and ability to model trend without requiring stationarity. The ETS(M,Ad,N) structure captures the level, trend, and seasonal components effectively. Next, we transform the series into a stationary process through differencing and log transformation as needed. We first apply the ARIMA(p,d,q) model to capture the autocorrelation structure in the stationary series. We determine the orders p and q by observing the ACF and PACF plots. Subsequently, we fit a SARIMA model to account for seasonal components observed in the autocorrelation and partial autocorrelation plots. Recognizing the presence of volatility clustering in the residuals, we extend both ARIMA and SARIMA models by incorporating a GARCH(1,1) (Generalized Autoregressive Conditional Heteroscedasticity) specification to model time-varying conditional variance.
+
+## Multivariate Modeling with Exogenous Variables
+To improve forecast accuracy by integrating relevant climatic and macroeconomic indicators, we apply multivariate modeling approaches. We select external predictors including temperature, precipitation, and exchange rates, and applied differencing and log transformation needed to transform the variables into stationary. We first fit a Multiple Linear Regression (MLR) using those predictors. After checking residual diagnostics, we apply ARIMAX to model remaining autocorrelation in the residuals. If seasonality is still present, we fit a SARIMAX model to jointly capture both seasonal and external effects.
+Given evidence of heteroscedasticity in residuals from ARIMAX and SARIMAX models, we further combine them with GARCH to address conditional variance dynamics. This results in hybrid ARIMAX-GARCH and SARIMAX-GARCH models that jointly model the conditional mean and variance, leveraging both autoregressive dynamics and exogenous factors.
+
+## Model Selection
+Model selection is guided by information criteria (AIC) and forecasting performance is evaluated using RMSE on a hold-out test set.
+
+# Data
+
+This project uses three primary datasets to model cocoa prices and explore their relationships with climate conditions and currency fluctuations:
+
+## Cocoa Prices:
+The “Daily Prices_ICCO.csv” file contains daily cocoa prices in US dollars per tonne from March 1994 to February 2025, published by the International Cocoa Organization (ICCO). To emphasize long-term trends and reduce short-term noise, we aggregated prices into monthly averages. This smoothed series reveals several major cycles over the decades, culminating in a sharp rise from late 2023 through 2025 (Figure 1).
+
+```{r fig.cap='The top panel (“data”) shows the original time series, illustrating a marked price surge after 2023. The second panel (“seasonal”) reveals a regular yearly cycle in cocoa prices, while the third panel (“trend”) captures the long-term upward movement over the period. The bottom panel (“remainder”) contains the residual fluctuations that remain after accounting for seasonality and trend.', fig.width=4.5, fig.height=3.3}
+#| echo: false
+#| warning: false
+#| message: false
+#| results: 'hide'
+# Convert xts to ts for decomposition
+start_year <- as.numeric(substr(start(ts_train), 1, 4))
+start_month <- as.numeric(substr(start(ts_train), 6, 7))
+ts_train_ts <- ts(as.numeric(ts_train), start = c(start_year, start_month), frequency = 12)
+decomp <- stl(ts_train_ts, s.window = "periodic")
+plot(decomp, main = "Time Series Decomposition of Monthly Cocoa Price (1994–2025)", cex.main = 3)
+```
+From 1994 to 2023, monthly cocoa prices slightly grew with some fluctuation. Prices then surged in 2024, briefly dipped, and continued rising into 2025. To reduce noise and highlight long-term trends, the data was aggregated into monthly averages, providing a smoother basis for modeling.
+
+## Climate Data (Ghana):
+Daily climate data for Ghana were sourced from two files: “Ghana_data.csv” (2013–2024) and “ghana_data_24-25.csv” (2024–2025), the latter retrieved from the [NCEI database](https://www.ncei.noaa.gov/access/past-weather/Ghana). These datasets were merged to form a complete time series of average temperature (`TAVG`), maximum and minimum temperatures (`TMAX`, `TMIN`), and daily precipitation (`PRCP`). Ghana’s bimodal rainfall pattern is evident in the June and October peaks (Figure 2, left), while temperature exhibits a clear seasonal cycle with warmer months occurring around March–April (Figure 2, right).
+
+```{r fig.cap='Left: Line plot of average monthly precipitation in Ghana (bimodal peaks in June and October). Right: Boxplot of monthly average temperatures showing seasonal variation.', fig.width=5, fig.height=2}
+#| echo: false
+#| warning: false
+#| message: false
+
+# Select 4 evenly spaced months
+month_labels <- c("Jan", "Apr", "Jul", "Oct")
+
+# Left plot: Average Monthly Precipitation
+monthly_precip_by_month <- cocoa_data %>%
+  mutate(Month = month(YearMonth, label = TRUE, abbr = TRUE)) %>%
+  group_by(Month) %>%
+  summarise(avg_precip = mean(PRCP, na.rm = TRUE))
+
+# Left plot: Average Monthly Precipitation
+p1 <- ggplot(monthly_precip_by_month, aes(x = Month, y = avg_precip, group = 1)) +
+  geom_line(color = "cornflowerblue") +
+  geom_point(size = 2) +
+  labs(title = "Average Monthly Precipitation", x = "Month", y = "Precipitation (inches)") +
+  scale_x_discrete(breaks = month_labels) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 10),
+    axis.title.x = element_text(size = 9),
+    axis.title.y = element_text(size = 9)
+  )
+
+# Right plot: Average Monthly Temperature
+p2 <- ggplot(cocoa_data, aes(x = factor(month(YearMonth, label = TRUE)), y = TAVG)) +
+  geom_boxplot(fill = "steelblue") +
+  labs(title = "Average Monthly Temperature", x = "Month", y = "TAVG (°F)") +
+  scale_x_discrete(breaks = month_labels) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 10),
+    axis.title.x = element_text(size = 9),
+    axis.title.y = element_text(size = 9)
+  )
+p1 + p2
+```
+The precipitation pattern in Ghana follows a bimodal distribution, characteristic of regions with two rainy seasons. The highest rainfall typically occurs in June, followed by a second peak in October. Drier months span from January to March and again in December. The boxplot of average monthly temperature shows an obvious seasonal pattern, with higher temperatures observed between February and April and slightly cooler conditions. from July to September.
+
+## Exchange Rate Data:
+Finally, the “USD_GHS.csv”, downloaded from [Investing website](https://www.investing.com/currencies/usd-ghs-historical-data), records daily exchange rate data for the Ghanaian cedi (GHS) against the U.S. dollar (USD), covering the same period as the other datasets. The exchange rate data is used to reflect the potential influence of international trade costs and inflation levels on cocoa prices.
+```{r fig.cap='Cocoa prices in USD and GHS. While USD prices spiked in 2024–2025, GHS prices show a more sustained rise due to exchange rate depreciation.', fig.width=4, fig.height=2.5}
+#| echo: false
+#| warning: false
+#| message: false
+
+cocoa_long <- cocoa_data %>%
+  mutate(Price_GHS = Price * currency) %>%
+  select(YearMonth, Price, Price_GHS) %>%
+  rename(USD = Price, GHS = Price_GHS) %>%
+  pivot_longer(cols = c("USD", "GHS"), names_to = "Currency", values_to = "Price")
+
+# Step 2: Plot with facets and legend
+ggplot(cocoa_long, aes(x = YearMonth, y = Price, color = Currency, linetype = Currency)) +
+  geom_line() +
+  facet_wrap(~Currency, scales = "free_y", ncol = 1) +
+  labs(title = "Cocoa Price in USD vs GHS (Monthly)", x = "Date", y = "Price per tonne", color = "Currency", linetype = "Currency") +
+  theme_minimal() +
+  theme(legend.position = "bottom", legend.text = element_text(size = 8), legend.title = element_text(size = 8), plot.title = element_text(hjust = 0.5, size = 10), axis.title.x = element_text(size = 8), axis.title.y = element_text(size = 8))
+```
+Figure 3 compares cocoa prices in USD and GHS. While USD prices surged in 2024–2025, GHS prices show a more consistent long-term rise due to currency depreciation, highlighting stronger inflationary impacts for local Ghanaian stakeholders.
+
+## Correlation Analysis
+```{r fig.cap='Heatmap of correlations between differenced log cocoa prices, exchange rate, precipitation, and temperature. The strongest correlation observed between cocoa price and currency.', fig.width=5, fig.height=3, fig.align='center', out.extra=''}
+#| echo: false
+#| warning: false
+#| message: false
+
+# Calculate the correlation matrix
+cor_matrix <- train_data %>% 
+  select(difflogPrice, difflogcurrency, TAVG, PRCP) %>% 
+  cor(use = "complete.obs")
+
+cor_matrix <- round(cor(cor_matrix), 2)
+
+# Melt the correlation matrix for ggplot
+cor_melt <- melt(cor_matrix)
+
+# Create the heatmap using ggplot2
+ggplot(cor_melt, aes(x = Var1, y = Var2, fill = value)) +
+  geom_tile(color = "white") +  # Add grid lines
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0, limit = c(-1,1), space = "Lab", name="Correlation") +
+  geom_text(aes(label = value), color = "black", size = 4) +
+  labs(title = "Correlation Heatmap between Variables of Interest", x = "", y = "") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 10, hjust = 0.5),
+        axis.text.x = element_text(angle = 30, hjust = 1, size = 8),
+        axis.text.y = element_text(size = 8),
+        legend.title = element_text(size = 8),
+        legend.text = element_text(size = 8)) +
+  coord_fixed()
+```
+The correlation heatmap (Figure 4) shows cocoa prices (`difflogPrice`) are most strongly linked to exchange rate changes (`difflogcurrency`, –0.47), indicating currency effects are key drivers. Weather variables (`PRCP`, `TAVG`) are less correlated with price, but their mutual correlation (–0.62) suggests overlapping seasonal influences on cocoa production.
+
+# Forecasting and Results
+
+## Model Training and Validation
+We applied several time series models to forecast monthly cocoa prices, except ETS, the remaining models were trained using log-transformed price data to ensure stationarity, confirmed via the Augmented Dickey-Fuller test (Table 1). The models were then evaluated on the held-out test set to assess forecasting performance.
+
+```{r}
+#| include: false
+#| warning: false
+#| message: false
+#| results: 'hide'
+
+# Fit ETS model and forecast
+fit_ets <- ets(ts_train)
+forecast_ets <- forecast(fit_ets, h = length(ts_test))
+
+# Calculate RMSE
+preds <- as.numeric(forecast_ets$mean)
+actuals <- as.numeric(ts_test)
+rmse_ets <- sqrt(mean((preds - actuals)^2))
+print(rmse_ets)
+```
+
+```{r}
+#| include: false
+#| warning: false
+#| message: false
+#| results: 'hide'
+
+# Check stationary
+adf.test(ts_train)
+log_ts <- log(ts_train)
+log_ts_test <- log(ts_test)
+
+adf.test(log_ts)
+adf.test(na.omit(diff(log_ts)))
+```
+
+```{r}
+#| include: false
+#| warning: false
+#| message: false
+#| results: 'hide'
+
+# Augmented Dickey-Fuller Test for price
+adf.test(train_data$Price)
+adf.test(train_data$logPrice)
+adf.test(train_data$difflogPrice)
+```
+
+```{r}
+#| include: false
+#| warning: false
+#| message: false
+#| results: 'hide'
+# Augmented Dickey-Fuller Test for currency
+adf.test(train_data$currency)
+adf.test(train_data$logcurrency)
+adf.test(train_data$difflogcurrency)
+```
+
+```{r}
+#| include: false
+#| warning: false
+#| message: false
+#| results: 'hide'
+# Augmented Dickey-Fuller Test for PRCP
+adf.test(train_data$PRCP)
+adf.test(train_data$logPRCP)
+adf.test(train_data$difflogPRCP)
+```
+
+```{r}
+#| include: false
+#| warning: false
+#| message: false
+#| results: 'hide'
+# Augmented Dickey-Fuller Test for FAVG
+adf.test(train_data$TAVG)
+adf.test(train_data$logTAVG)
+adf.test(train_data$difflogTAVG)
+```
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+adf_results <- data.frame(
+  Data = c("Original Price Time Series", "Log-Transformed Price Time Series", "First-Order Differenced Log-Transformed Price Time Series", "Original Exchange Rate Series", "Log-Transformed Exchange Rate Series", "First-Order Differenced Log-Transformed Exchange Rate Series", "Precipitation", "Temperature"),
+  `p-value` = c(0.6311, 0.2119, 0.01, 0.99, 0.9773, 0.01, 0.01, 0.01),
+  `Conclusion` = c("Not Stationary", "Not Stationary", "Stationary", "Not Stationary", "Not Stationary", "Stationary", "Stationary", "Stationary"))
+
+kable(adf_results, caption = "Augmented Dickey-Fuller Test Results for Prices Time Series")
+```
+
+## Performance Evaluation and Forecast
+All models were evaluated using Root Mean Square Error (RMSE). In our fitted ETS(M,Ad,N) model, the level and trend components were updated based on the most recent error scaled by the estimated values of $\alpha$, $\beta$, and $\phi$. The model assumed no seasonality, and the damping factor $\phi = 0.8$ ensured that the trend flattens over time. The high value of $\alpha = 1$ indicated the model gave heavy weight to the latest observations. The ETS model captured the general trend but failed to account for the sharp surge in prices after 2023, resulting in test performance RMSE = 3415.927.
+
+```{r fig.cap='Autocorrelation (ACF) and Partial Autocorrelation (PACF) of First-Order Differenced Log-Transformed Price Series.', fig.width=4, fig.height=2.7}
+#| echo: false
+#| warning: false
+#| message: false
+#| results: 'hide'
+
+acf2(diff(log_ts))
+```
+Figure 5 indicated the ACF plot was cutting off after lag 1, while PACF was tailing off; or the ACF plot was tailing off, while PACF was cutting off after lag 1. Thus, we fitted both ARIMA(0,1,1) and ARIMA(1,1,0) models. Based on Table 2, ARIMA(0,1,1) had a lower AIC and thus a better model. From the result of ARIMA(0,1,1), we got $\theta_1 = 0.1786$, the fitted model became $x_t = x_{t-1} + w_t + 0.1786w_{t-1}$. The ARIMA(0,1,1) model performed better than ETS model with test RMSE = 3262.890, but it underestimated the magnitude of recent price spikes.
+```{r}
+#| include: false
+#| warning: false
+#| message: false
+#| results: 'hide'
+model_1 <- sarima(log_ts, 0, 1, 1)
+model_2 <- sarima(log_ts, 1, 1, 0)
+fit_arima <- auto.arima(log_ts, seasonal = FALSE)
+forecast_arima <- forecast(fit_arima, h = length(log_ts_test))
+summary(fit_arima)
+
+# Inverse log
+forecast_arima_exp <- exp(forecast_arima$mean)
+rmse_arima <- sqrt(mean((forecast_arima_exp - ts_test)^2, na.rm = TRUE))
+```
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+aic_results <- data.frame(
+  Data = c("ARIMA(0,1,1)", "ARIMA(1,1,0)"),
+  `AIC` = c(-2.660904, -2.660185))
+kable(aic_results, caption = "Akaike information criterion (AIC) for ARIMA Models")
+```
+A SARIMA model was also fitted to account for potential seasonal patterns. However, the selected model did not report any seasonal components, effectively reducing to the same ARIMA(0,1,1) structure. As a result, both the model equation and forecasting performance were identical to those of the non-seasonal ARIMA model, suggesting that seasonal effects were not significant in this case. Since the ARIMA forecasts followed the general trend but missed sudden structural shifts.
+
+Residual analysis (Figure 6) showed volatility clustering, suggesting time-varying variance that ARIMA/SARIMA could not capture. Thus, after fitting the ARIMA(0,1,1) model to capture the conditional mean, we used a GARCH(1,1) model to estimate the time-varying volatility of the residuals.
+```{r}
+#| include: false
+#| warning: false
+#| message: false
+#| results: 'hide'
+
+fit_sarima <- auto.arima(log_ts, seasonal = TRUE)
+forecast_sarima <- forecast(fit_sarima, h = length(log_ts_test))
+forecast_sarima_exp <- exp(forecast_sarima$mean)
+summary(fit_sarima)
+rmse_sarima <- sqrt(mean((forecast_sarima_exp - ts_test)^2, na.rm = TRUE))
+```
+
+```{r fig.cap='Residual Diagnostics for ARIMA(0,1,1). The residuals fluctuate around zero but show clustering, suggesting autocorrelation. The ACF plot confirms this, with several lags outside the 95% confidence bounds.', fig.width=5, fig.height=2.5}
+#| echo: false
+#| warning: false
+#| message: false
+#| results: 'hide'
+
+# Residuals from ARIMA
+residuals_arima <- residuals(fit_arima)
+checkresiduals(fit_arima)
+```
+The result fitted model was $\hat x_t = x_{t-1} + w_t + 0.1786w_{t-1}$, $w_t = \sigma_t \epsilon_t, \sigma_t \sim N(0,1), \sigma_t^2 = 0.0001999 + 0.1714 \cdot w_{t-1}^2 + 0.8006 \cdot \sigma_{t-1}^2$. The point forecasts were calculated as the exponential of the ARIMA forecast mean plus half the forecast variance, following the log-normal correction. The model performed well and captured the timing and general direction of price movements (Figure 7). The test RMSE of the ARIMA + GARCH model was 3213.588, which outperformed previous models, indicating that modeling volatility helped enhance forecasting accuracy. However, the model still underestimated the peak values of recent price spikes, although to a lesser extent than ARIMA alone.
+
+```{r fig.cap='ARIMA + GARCH forecast of monthly cocoa prices on the natural scale since 2020. The grey line shows the historical training data, the black line represents the test data, and the red line is the forecasted price. The blue shaded areas denote the 80% and 95% prediction intervals.', fig.width=4, fig.height=2}
+#| echo: false
+#| warning: false
+#| message: false
+#| results: 'hide'
+
+arima_mean <- forecast_arima$mean
+
+spec <- ugarchspec(
+  variance.model = list(model = "sGARCH", garchOrder = c(1,1)),
+  mean.model     = list(armaOrder = c(0,0), include.mean = FALSE),
+  distribution.model = "norm"
+)
+garch_fit <- ugarchfit(spec, data = residuals_arima)
+
+# Forecast volatility using the fitted GARCH model over the test horizon
+garch_forecast <- ugarchforecast(garch_fit, n.ahead = length(ts_test))
+garch_sd <- sigma(garch_forecast)  # Forecast standard deviations
+
+# --- Combine ARIMA mean forecast with the GARCH volatility ---
+forecast_point_nat <- exp(arima_mean + 0.5 * (garch_sd)^2)
+lower_95_nat <- exp(arima_mean - 1.96 * garch_sd)
+upper_95_nat <- exp(arima_mean + 1.96 * garch_sd)
+lower_80_nat <- exp(arima_mean - 1.28 * garch_sd)
+upper_80_nat <- exp(arima_mean + 1.28 * garch_sd)
+
+# Calculate RMSE on the original scale:
+rmse_garch <- sqrt(mean((forecast_point_nat - ts_test)^2, na.rm = TRUE))
+
+# Build a dataframe for historical actual prices (training data on natural scale):
+hist_df_nat <- tibble(
+  Date = as.Date(as.yearmon(time(ts_train))),
+  Price = as.numeric(ts_train)
+)
+# Combine last point of training and all of test into a continuous test line
+last_train_point <- tail(hist_df_nat, 1)
+
+# Build a dataframe for plotting forecasts (on natural scale):
+plot_df_nat <- tibble(
+  Date = as.Date(as.yearmon(time(ts_test))),
+  Forecast = as.numeric(forecast_point_nat),
+  Upper_95 = as.numeric(upper_95_nat),
+  Lower_95 = as.numeric(lower_95_nat),
+  Upper_80 = as.numeric(upper_80_nat),
+  Lower_80 = as.numeric(lower_80_nat)
+)
+plot_df_nat_continuous <- bind_rows(last_train_point, plot_df_nat)
+plot_df_nat_continuous$Forecast[1] <- 6583
+
+# And one for test actual prices:
+test_df_nat <- tibble(
+  Date = as.Date(as.yearmon(time(ts_test))),
+  Price = as.numeric(ts_test)
+)
+test_df_nat_continuous <- bind_rows(last_train_point, test_df_nat)
+
+# Filter training data from 2020 onward
+hist_df_nat <- hist_df_nat %>% filter(Date >= as.Date("2020-01-01"))
+
+# Plot
+ggplot() +
+  geom_line(data = hist_df_nat, aes(x = Date, y = Price), color = "grey40") +
+  geom_line(data = test_df_nat_continuous, aes(x = Date, y = Price), color = "black", size = 0.6) +
+  geom_ribbon(data = plot_df_nat, aes(x = Date, ymin = Lower_95, ymax = Upper_95),
+              fill = "blue", alpha = 0.2) +
+  geom_ribbon(data = plot_df_nat, aes(x = Date, ymin = Lower_80, ymax = Upper_80),
+              fill = "blue", alpha = 0.4) +
+  geom_line(data = plot_df_nat_continuous, aes(x = Date, y = Forecast), color = "red", linewidth = 0.6) +
+  labs(title = "ARIMA + GARCH Forecast (Natural Scale)",
+       x = "Date", y = "Price") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, size = 10),
+        axis.title.x = element_text(size = 8),
+        axis.title.y = element_text(size = 8))
+```
+
+To incorporate external factors like temperature, precipitation, and exchange rates, the Multiple Linear Regression (MLR) model was constructed. To ensure stationarity, the predictors were log-transformed and differenced as shown in Table 1. Before model fitting, a correlation heatmap between the transformed variables was generated (Figure 4), revealing a strong correlation between precipitation (`PRCP`) and average temperature (`TAVG`), while `PRCP` and the transformed exchange rate showed weaker correlation.
+
+Due to the high correlation between PRCP and TAVG, we fitted two multiple linear regression models:
+$$\text{MLR Model 1:} \hat{\quad \Delta \log(\text{Price})} = -0.151 - 0.061 \Delta \log(\text{Currency}) + 0.0019 \text{TAVG} + 0.0002 \text{PRCP}$$
+$$\text{MLR Model 2:} \hat{\quad \Delta \log(\text{Price})} = -0.137 + 0.002 \text{TAVG} - 0.0498 \Delta \log(\text{Currency})$$
+Among the fitted models, `MLR Model 2` demonstrated a lower AIC of -967.4611 (Table 3), indicating a better model fit. Additionally, the Variance Inflation Factor (VIF) for `TAVG` and the transformed exchange rate was ~1, confirming the absence of multicollinearity. Thus, `MLR Model 2` was selected. We checked four assumptions for multiple linear regression in Figure 8. All assumptions were satisfied besides there is a cluster of residuals in the residual plot. To assess residual autocorrelation, we performed the Ljung-Box Test on `MLR Model 2`, as shown in Table 3. The resulting p-value (> 0.05) suggests that residual autocorrelation persists, indicating that the model fails to capture some temporal dependencies. This finding highlighted the potential need for incorporating additional time series components, such as ARIMA, to better address residual correlations.
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+# Fit a preliminary MLR model
+mlr_model <- lm(difflogPrice ~ difflogcurrency + TAVG + PRCP, data = train_data)
+mlr_model_4 <- lm(difflogPrice ~ TAVG + difflogcurrency, data = train_data)
+
+# Perform the Ljung-Box test on residuals of mlr_model_4
+mlr_model_4_residuals <- residuals(mlr_model_4)
+ljung_box_test <- Box.test(mlr_model_4_residuals, lag = 20, type = "Ljung-Box")
+
+# Extract the p-value from the Ljung-Box test
+ljung_box_p_value <- round(ljung_box_test$p.value, 4)
+
+# Create a combined table with AIC, VIF, and Ljung-Box p-value
+model_results <- data.frame(
+  Model = c("MLR 1 (currency + TAVG + PRCP)", "", "", 
+            "MLR 2 (TAVG + currency)", ""),
+  AIC = c(round(AIC(mlr_model), 4), "", "", 
+          round(AIC(mlr_model_4), 4), ""),
+  Variable = c("TAVG", "difflogcurrency", "PRCP", 
+               "TAVG", "difflogcurrency"),
+  VIF = c("", "", "", 
+          "1.000053", "1.000053"),
+  Ljung_Box_P_Value = c("", "", "", 
+                        ljung_box_p_value, "")
+)
+
+# Display the results using kable
+kable(model_results, caption = "Model Comparison with AIC, VIF, and Ljung-Box Test")
+```
+```{r fig.cap='The top-left panel ("Residuals vs Fitted") shows there is a noticeable banded clustering along the x-axis, which suggests potential autocorrelation rather than random noise. The top-right Q-Q plot indicates a moderate departure from normality in the tails. The bottom-left "Scale-Location" plot shows the residuals appear to have relatively constant variance. The bottom-right "Residuals vs Leverage" plot identifies no influential points exceed Cook’s distance threshold, indicating model stability.', fig.height=3.8, fig.height=3.6}
+#| echo: false
+#| warning: false
+#| message: false
+#| results: 'hide'
+par(mfrow = c(2, 2))
+plot(mlr_model_4)
+```
+Similar to pure time series modeling, we selected an ARIMA(0,1,1) model with regression to account for temporal dependencies while incorporating external factors. The fitted model resulted in an RMSE of 3171.380, indicating a better fit. The prediction equation of the ARIMAX model can be expressed as:$\hat{\quad \Delta \log(\text{Price})} = - 0.0625 \Delta \log(\text{Currency}) + 0.1886 w_{t-1}$.
+```{r}
+#| include: false
+#| warning: false
+#| message: false
+#| results: 'hide'
+# ARIMAX Model
+xreg <- as.matrix(train_data[, c("TAVG", "difflogcurrency")])
+arimax_model <- auto.arima(train_data$difflogPrice, xreg = xreg, seasonal = FALSE, trace = TRUE)
+
+# Forecasting with ARIMAX
+xreg_future <- as.matrix(test_data[, c("TAVG", "difflogcurrency")])
+arimax_forecast <- forecast(arimax_model, xreg = xreg_future, h = nrow(test_data))
+
+# Transforming the forecasted differenced log prices back to raw prices
+last_price <- tail(train_data$Price, 1)  # Last actual price from the training data
+
+# Transform forecasted values back to the original price scale
+forecasted_diff_log <- arimax_forecast$mean
+raw_forecasted <- last_price * exp(cumsum(forecasted_diff_log))
+
+# Transform actual test values back to the original price scale
+raw_actual <- last_price * exp(cumsum(test_data$difflogPrice))
+
+# Combine results for comparison
+forecast_results <- data.frame(
+  Time = 1:length(raw_actual),
+  Actual = raw_actual,
+  Forecast = raw_forecasted
+)
+
+# Accuracy metrics on the original price scale
+accuracy_metrics_arima <- data.frame(
+  ME = mean(forecast_results$Actual - forecast_results$Forecast, na.rm = TRUE),
+  RMSE = sqrt(mean((forecast_results$Actual - forecast_results$Forecast)^2, na.rm = TRUE)),
+  MAE = mean(abs(forecast_results$Actual - forecast_results$Forecast), na.rm = TRUE),
+  MAPE = mean(abs((forecast_results$Actual - forecast_results$Forecast) / forecast_results$Actual), na.rm = TRUE) * 100
+)
+```
+```{r fig.cap='Residuals fluctuate around zero but show clustering, especially toward the end, indicating conditional heteroscedasticity. violating the white noise assumption for ARIMA model.', fig.width=4, fig.height=2.5}
+#| echo: false
+#| warning: false
+#| message: false
+#| results: 'hide'
+# Residual Diagnosis of ARIMAX Model
+
+# Extract residuals from the ARIMAX model
+arimax_residuals <- residuals(arimax_model)
+
+# Residual Plot: Check for randomness
+plot(arimax_residuals, type = "l", col = "blue",
+     main = "Residuals from ARIMAX Model",
+     xlab = "Time", ylab = "Residuals")
+abline(h = 0, col = "red", lty = 2)
+```
+However, residual analysis (Figure 9) indicated the presence of conditional heteroscedasticity, where the residuals of the ARIMAX model display long-term volatility patterns. This behavior violated the assumption of white noise residuals, suggesting that the model fails to capture long-term volatility dynamics.
+Given the observed issues, we considered using a SARIMA model with regression, which allows for capturing both seasonal effects and residual trends. This approach aimed to improve model performance by addressing volatility clustering and reducing residual autocorrelation. However, the resulting model did not incorporate any seasonal components, effectively resulting in a model structure equivalent to to ARIMAX(0,1,1). Consequently, both the model equation and the forecasting accuracy were identical to those of the non-seasonal ARIMAX model, with the same RMSE value of 3171.380. This outcome indicates that seasonal effects were not statistically significant in the transformed cocoa price data, suggesting that the model could not capture any meaningful seasonal trends.
+In financial contexts, such as cocoa futures prices, the assumption of uncorrelated residuals in time series models is often unrealistic. This violates the constant variance assumption inherent in ARIMA-based models, particularly when dealing with volatility clustering. To address this issue, we integrated the ARIMAX and GARCH(p, q) models to better capture time-varying variance.
+The combined model leverages ARIMA(0,1,1) to model the mean equation and GARCH(3,13) to account for conditional variance. This approach allowed us to model both linear dependencies and dynamic volatility patterns effectively. After fitting this combined model,
+
+1. The predicted mean equation of the ARIMA(0,1,1) with regression is expressed as:
+
+$$\hat{\quad \Delta \log(\text{Price})} = -0.1367 + 0.0017 \cdot \text{TAVG} - 0.0623 \cdot \Delta \log(\text{Currency}) + 0.1877 \cdot \epsilon_{t-1}$$
+2. Conditional variance equation of the GARCH(3,13) model for the conditional variance is expressed as:
+$$r_t = \sigma_t \epsilon_t, \sigma_t^2 = 0.000004 + \sum_{i=1}^{p} \alpha_i r_{t-i}^2 + \sum_{j=1}^{q}\beta_j\sigma_{t-j}^2$$
+where $\alpha_1 = \alpha_2 = \dots = \alpha_p = 0.0167$; $\beta_1 = \beta_2 = \dots = \beta_q = 0.0692$, indicating that the ARCH and GARCH terms are equal, suggesting stable variance behavior; $r_t = \frac{x_t-x_{t-1}}{x_{t-1}}$is the return or growth rate.
+
+3. The predicted original cocoa price can be obtained by reversing the transformation as follows:
+$$\hat{\text{Price}_{t}} = \hat{\text{Price}_{t-1}} \times e^{\hat{\Delta \log(\text{Price})}}$$
+where $\hat{y_t}$ is the predicted mean at time t.
+
+The prediction results obtained from the ARIMAX + GARCH model are visualized in Figure 10, which shows the predicted cocoa price series. The model successfully improves the general trend while also accounting for volatility clustering. 
+
+```{r}
+#| include: false
+#| warning: false
+#| message: false
+#| results: 'hide'
+# Ljung-Box Test for residual independence
+ljung_box_test <- Box.test(arimax_residuals, lag = 20, type = "Ljung-Box")
+print("Ljung-Box Test for Residual Independence:")
+print(ljung_box_test)
+```
+
+```{r}
+#| include: false
+#| warning: false
+#| message: false
+#| results: 'hide'
+# SARIMAX Model
+xreg <- as.matrix(train_data[, c("TAVG", "difflogcurrency")])
+
+# Set the data as a time series with frequency (e.g., 12 for monthly data)
+train_ts <- ts(train_data$difflogPrice, frequency = 12)
+
+# Fit the SARIMAX model
+arimax_model <- auto.arima(train_ts, xreg = xreg, seasonal = TRUE, trace = TRUE)
+
+# Forecasting with SARIMAX using the test data
+xreg_future <- as.matrix(test_data[, c("TAVG", "difflogcurrency")])
+arimax_forecast <- forecast(arimax_model, xreg = xreg_future, h = nrow(test_data))
+
+# Transforming the forecasted differenced log prices back to raw prices
+last_price <- tail(train_data$Price, 1)  # Last actual price from the training data
+
+# Transform forecasted values back to the original price scale
+forecasted_diff_log <- arimax_forecast$mean
+raw_forecasted <- last_price * exp(cumsum(forecasted_diff_log))
+
+# Transform actual test values back to the original price scale
+raw_actual <- last_price * exp(cumsum(test_data$difflogPrice))
+
+# Combine results for comparison
+forecast_results <- data.frame(
+  Time = 1:length(raw_actual),
+  Actual = raw_actual,
+  Forecast = raw_forecasted
+)
+
+# Accuracy metrics on the original price scale
+accuracy_metrics_sarima <- data.frame(
+  ME = mean(forecast_results$Actual - forecast_results$Forecast, na.rm = TRUE),
+  RMSE = sqrt(mean((forecast_results$Actual - forecast_results$Forecast)^2, na.rm = TRUE)),
+  MAE = mean(abs(forecast_results$Actual - forecast_results$Forecast), na.rm = TRUE),
+  MAPE = mean(abs((forecast_results$Actual - forecast_results$Forecast) / forecast_results$Actual), na.rm = TRUE) * 100
+)
+```
+
+```{r fig.cap='ARIMAX + GARCH forecast of monthly cocoa prices on the natural scale since 2020. The grey line shows the historical training data, the black line represents the test data, and the red line is the forecasted price. The blue shaded areas denote the 80% and 95% prediction intervals.', fig.width=4, fig.height=2}
+#| echo: false
+#| warning: false
+#| message: false
+#| results: 'hide'
+
+# Convert training response series to xts format
+train_data_ts <- xts(train_data$difflogPrice, order.by = as.Date(paste0(train_data$YearMonth, "-01")))
+
+# Specify ARIMAX-GARCH model
+spec_arimax_garch <- ugarchspec(
+  variance.model = list(model = "sGARCH", garchOrder = c(3, 13)),
+  mean.model = list(armaOrder = c(0, 1), include.mean = TRUE,
+                    external.regressors = as.matrix(train_data[, c("TAVG", "difflogcurrency")])),
+  distribution.model = "norm"
+)
+
+# Fit the model
+fit_arimax_garch <- ugarchfit(spec = spec_arimax_garch, data = train_data_ts)
+
+# Forecast
+xreg_future <- as.matrix(test_data[, c("TAVG", "difflogcurrency")])
+garch_forecast <- ugarchforecast(fit_arimax_garch, n.ahead = nrow(test_data),
+                                  external.forecasts = list(mregfor = xreg_future))
+
+# Extract forecasts
+forecasted_mean <- fitted(garch_forecast)
+forecasted_sigma <- sigma(garch_forecast)
+
+# Convert back to original price scale
+last_price <- tail(train_data$Price, 1)
+raw_forecasted <- last_price * exp(cumsum(as.numeric(forecasted_mean)))
+raw_actual <- last_price * exp(cumsum(as.numeric(test_data$difflogPrice)))
+
+# Build time axis
+forecast_dates <- seq.Date(from = as.Date(paste0(tail(train_data$YearMonth, 1), "-01")),
+                           by = "month", length.out = nrow(test_data))
+train_dates <- as.Date(paste0(train_data$YearMonth, "-01"))
+
+# Full data frame
+forecast_results <- data.frame(
+  Time = c(train_dates, forecast_dates),
+  Actual = c(train_data$Price, raw_actual),
+  Forecast = c(rep(NA, length(train_data$Price)), raw_forecasted)
+)
+
+# Add prediction intervals
+forecast_results$Lower_95 <- forecast_results$Forecast - 1.96 * c(rep(NA, length(train_data$Price)), forecasted_sigma)
+forecast_results$Upper_95 <- forecast_results$Forecast + 1.96 * c(rep(NA, length(train_data$Price)), forecasted_sigma)
+forecast_results$Lower_80 <- forecast_results$Forecast - 1.28 * c(rep(NA, length(train_data$Price)), forecasted_sigma)
+forecast_results$Upper_80 <- forecast_results$Forecast + 1.28 * c(rep(NA, length(train_data$Price)), forecasted_sigma)
+
+# Label training vs test
+forecast_results$Label <- c(rep("Training Data", length(train_data$Price)),
+                            rep("Test Data", length(raw_actual)))
+
+# Filter to start from 2020
+forecast_results <- forecast_results %>% filter(Time >= as.Date("2020-01-01"))
+
+# Connect last training point to test line
+train_tail_point <- tail(forecast_results[forecast_results$Label == "Training Data", ], 1)
+test_df_continuous <- bind_rows(train_tail_point,
+                                forecast_results[forecast_results$Label == "Test Data", ])
+
+# Forecast line: set one point before forecast to last actual value for continuity
+forecast_df_continuous <- forecast_results[, c("Time", "Forecast", "Upper_95", "Lower_95", "Upper_80", "Lower_80")]
+first_forecast_idx <- which(!is.na(forecast_df_continuous$Forecast))[1]
+# Index of forecast points (non-NA Forecast values)
+forecast_idx <- which(!is.na(forecast_df_continuous$Forecast))
+
+# Ensure sigma and forecasted points match in length
+if (length(forecasted_sigma) != length(forecast_idx)) {
+  stop("Length of forecasted_sigma does not match forecast horizon.")}
+
+# Apply log-normal transformation to confidence intervals
+forecast_df_continuous$Lower_95[forecast_idx] <- exp(log(forecast_df_continuous$Forecast[forecast_idx]) - 1.96 * forecasted_sigma)
+forecast_df_continuous$Upper_95[forecast_idx] <- exp(log(forecast_df_continuous$Forecast[forecast_idx]) + 1.96 * forecasted_sigma)
+forecast_df_continuous$Lower_80[forecast_idx] <- exp(log(forecast_df_continuous$Forecast[forecast_idx]) - 1.28 * forecasted_sigma)
+forecast_df_continuous$Upper_80[forecast_idx] <- exp(log(forecast_df_continuous$Forecast[forecast_idx]) + 1.28 * forecasted_sigma)
+
+# Final plot
+ggplot() +
+  # Training data
+  geom_line(data = forecast_results %>% filter(Label == "Training Data"),
+            aes(x = Time, y = Actual), color = "grey40", size = 0.6) +
+  # Test actual values (connected)
+  geom_line(data = test_df_continuous,
+            aes(x = Time, y = Actual), color = "black", size = 0.6) +
+  # Confidence intervals
+  geom_ribbon(data = forecast_df_continuous,
+              aes(x = Time, ymin = Lower_95, ymax = Upper_95),
+              fill = "blue", alpha = 0.2) +
+  geom_ribbon(data = forecast_df_continuous,
+              aes(x = Time, ymin = Lower_80, ymax = Upper_80),
+              fill = "blue", alpha = 0.4) +
+  # Forecast line
+  geom_line(data = forecast_df_continuous,
+            aes(x = Time, y = Forecast), color = "red", linewidth = 0.6) +
+  labs(title = "ARIMAX-GARCH Forecast (Natural Scale)",
+       x = "Date", y = "Price") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, size = 10),
+      axis.title.x = element_text(size = 8),
+      axis.title.y = element_text(size = 8))
+
+# Accuracy metrics (on original price scale)
+accuracy_metrics_arima_garch <- data.frame(
+  ME = mean(forecast_results$Actual - forecast_results$Forecast, na.rm = TRUE),
+  RMSE = sqrt(mean((forecast_results$Actual - forecast_results$Forecast)^2, na.rm = TRUE)),
+  MAE = mean(abs(forecast_results$Actual - forecast_results$Forecast), na.rm = TRUE),
+  MAPE = mean(abs((forecast_results$Actual - forecast_results$Forecast) / forecast_results$Actual), na.rm = TRUE) * 100
+)
+```
+The residual plot of the ARIMAX-GARCH model as shown in Figure 11 illustrated a reduced residual trend, indicating that the ARIMAX-GARCH model improved residual autocorrelation.
+```{r fig.cap='Residuals from the ARIMAX–GARCH model. The variance appears to be more stable, with reduced clustering and fewer extreme spikes. This suggests the GARCH component successfully captured the time-varying volatility in the series.', fig.width=4, fig.height=2.5}
+#| echo: false
+#| warning: false
+#| message: false
+#| results: 'hide'
+
+residuals_garch <- residuals(fit_arimax_garch, standardize = TRUE)
+
+plot(as.ts(residuals_garch), type = "l", col = "blue",
+     main = "Residuals from ARIMAX-GARCH Model",
+     xlab = "Time", ylab = "Residuals")
+abline(h = 0, col = "red", lty = 2)
+```
+
+```{r}
+#| include: false
+#| warning: false
+#| message: false
+#| results: 'hide'
+# Normality Test: Jarque-Bera Test
+jarque_bera <- jarque.bera.test(residuals_garch)
+print(jarque_bera)
+```
+
+## Evaluation and Comparison
+Models were evaluated using RMSE on the natural price scale. As shown in Table 4, traditional models like ETS (3415.93), ARIMA (3262.89), and SARIMA (3262.89) captured overall trends but not volatility. Adding GARCH improved ARIMA’s performance (3213.59). Including exogenous variables in ARIMAX and SARIMAX further reduced RMSE to 3171.38. The best results came from the ARIMAX + GARCH model (3116.49), which combined external drivers and volatility, yielding the most accurate forecasts.
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+# Create data frame
+model_results <- data.frame(
+  Model = c("ETS", "ARIMA", "SARIMA", "ARIMA + GARCH", "ARIMAX", "SARIMAX", "ARIMAX + GARCH"),
+  RMSE = c(rmse_ets, rmse_arima, rmse_sarima, rmse_garch, accuracy_metrics_arima$RMSE, accuracy_metrics_sarima$RMSE, accuracy_metrics_arima_garch$RMSE)
+)
+
+# Display nicely
+kable(model_results, caption = "Summary of Model Performance using RMSE")
+```
+
+# Discussion and Conclusion
+
+In this study, we selected the ARIMAX-GARCH model as our final forecasting approach, combining trend analysis with volatility modeling. The model performed well during the training period and generated interpretable forecasts for the following four months. From October 2024 to January 2025, the predicted cocoa prices were 6670.68, 6739.88, 6792.23, and 6847.00 USD per tonnie. While these predictions were lower than the actual observed prices (7929.92, 10352.48, 10708.68, and 9826.81 USD per ton), the model successfully captured the upward trend, indicating a steady price increase. Beyond point forecasts, the model also predicted rising volatility, with the standard deviation increasing from 0.0481 to 0.0512, suggesting growing market uncertainty. Among all models considered, ARIMAX-GARCH achieved the lowest test RMSE (3116.66) on the natural scale. Although it tended to underestimate sharp price spikes, the forecasted patterns remained informative for decision-making.
+
+This modeling approach has practical value across sectors. For policymakers, early price forecasts support proactive strategies such as preemptive cocoa purchases or targeted subsidies. Farmers and cooperatives can use the forecasts to time sales and manage income risk, while volatility estimates encourage diversification or insurance. In finance and trade, the model aids in timing decisions and informs risk management tools, helping lenders and insurers tailor products for the agricultural sector.
+
+Despite these strengths, there are some limitations. First, the set of exogenous variables was limited; only temperature and exchange rate were included, while other influential factors such as global cocoa stock, exports, transportation costs, or geopolitical events were excluded. Moreover, the GARCH component, although effective in modeling volatility, introduced a number of parameters, some of which were not statistically significant—raising concerns about potential overfitting.
+
+Future work can address these challenges by incorporating more diverse data sources, including macroeconomic indicators and sector-specific variables. Additionally, experimenting with more flexible models such as LSTM or other machine learning techniques may help capture non-linear dynamics and abrupt shifts more effectively. These enhancements could improve both the accuracy and adaptability of cocoa price forecasting models.
+
+# References
+
+::: {#refs}
+:::
+
+# Appendix
+```{r eval=FALSE}
+cocoa_prices <- read.csv("Daily Prices_ICCO.csv", stringsAsFactors = FALSE)
+cocoa_prices$Date <- as.Date(cocoa_prices$Date, format='%d/%m/%Y')
+cocoa_prices$Price <- as.numeric(gsub(",", "", cocoa_prices$ICCO.daily.price..US..tonne.))
+cocoa_prices <- cocoa_prices %>% select(Date, Price) %>% arrange(Date)
+cocoa_prices <- cocoa_prices %>%mutate(YearMonth = floor_date(Date, "month")) %>%group_by(YearMonth) %>%summarise(Price = mean(Price, na.rm = TRUE))
+ghana_weather <- read.csv("Ghana_data.csv", stringsAsFactors = FALSE)
+ghana_weather$DATE <- as.Date(ghana_weather$DATE)
+ghana_weather <- ghana_weather %>%mutate(Date = ymd(DATE),PRCP = replace_na(as.numeric(PRCP), 0),TAVG = as.numeric(TAVG),TMAX = as.numeric(TMAX),TMIN = as.numeric(TMIN)) %>%select(Date, PRCP, TAVG, TMAX, TMIN)  # Drop junk columns
+ghana25 <- read_csv("ghana_data_24-25.csv", show_col_types = FALSE)
+ghana25$Date <- as.Date(ghana25$Date)
+ghana25 <- ghana25 %>%mutate(Date = ymd(Date),PRCP = replace_na(as.numeric(`PRCP (Inches)`), 0),TAVG = as.numeric(`TAVG (Degrees Fahrenheit)`),TMAX = as.numeric(`TMAX (Degrees Fahrenheit)`),TMIN = as.numeric(`TMIN (Degrees Fahrenheit)`)) %>%select(Date, PRCP, TAVG, TMAX, TMIN)
+latest_ghana_date <- max(ghana_weather$Date, na.rm = TRUE)
+ghana25_filtered <- ghana25[ghana25$Date > latest_ghana_date, ]
+ghana_weather <- bind_rows(ghana_weather, ghana25_filtered)
+ghana_weather <- ghana_weather %>% arrange(Date)
+ghana_weather <- ghana_weather %>%mutate(YearMonth = floor_date(Date, "month")) %>%group_by(YearMonth) %>%summarise(TAVG = mean(TAVG, na.rm = TRUE),PRCP = sum(PRCP, na.rm = TRUE))
+currency <- read_csv("USD_GHS.csv", show_col_types = FALSE)
+currency <- currency %>%mutate(Date = mdy(Date),currency = Price) %>%select(Date, currency)
+currency <- currency %>%mutate(YearMonth = format(Date, "%Y-%m")) %>%group_by(YearMonth) %>%summarise(currency = mean(currency, na.rm = TRUE))
+cocoa_prices <- cocoa_prices %>%mutate(YearMonth = as.Date(paste0(format(YearMonth, "%Y-%m"), "-01"))) %>%distinct(YearMonth, .keep_all = TRUE)
+ghana_weather <- ghana_weather %>%mutate(YearMonth = as.Date(paste0(format(YearMonth, "%Y-%m"), "-01"))) %>%distinct(YearMonth, .keep_all = TRUE)
+currency <- currency %>%mutate(YearMonth = as.Date(paste0(YearMonth, "-01"))) %>%distinct(YearMonth, .keep_all = TRUE)
+cocoa_data <- cocoa_prices %>%left_join(currency, by = "YearMonth") %>%left_join(ghana_weather, by = "YearMonth")
+cocoa_data <- cocoa_data %>%mutate(logPrice = log(Price+1),difflogPrice = c(NA, diff(logPrice)), logcurrency = log(currency+1),difflogcurrency = c(NA, diff(logcurrency)),logPRCP = log(PRCP+1), difflogPRCP = c(NA, diff(logPRCP)), diff2logPRCP = c(NA, NA, diff(diff(logPRCP))),logTAVG = log(TAVG+1), difflogTAVG = c(NA, diff(logTAVG)))
+cocoa_data <- cocoa_data %>% drop_na(difflogPrice,difflogcurrency,difflogPRCP,difflogTAVG)
+n <- nrow(cocoa_data)
+split_index <- n - 4
+train_data <- cocoa_data[1:split_index, ]
+test_data <- cocoa_data[(split_index + 1):n, ]
+ts_train <- xts(train_data$Price, order.by = as.Date(paste0(train_data$YearMonth, "-01")))
+ts_test <- xts(test_data$Price, order.by = as.Date(paste0(test_data$YearMonth, "-01")))
+ggplot(cocoa_data, aes(x = YearMonth)) + geom_line(aes(y = Price), color = "steelblue") + labs(title = "Monthly Cocoa Prices", y = "Price (US$/tonne)", x = "Month-Year") +theme_minimal() + theme(plot.title = element_text(hjust = 0.5))
+cor_matrix <- train_data %>% select(difflogPrice, difflogcurrency, TAVG, PRCP) %>% cor(use = "complete.obs")
+cor_matrix <- round(cor(cor_matrix), 2)
+cor_melt <- melt(cor_matrix)
+ggplot(cor_melt, aes(x = Var1, y = Var2, fill = value)) + geom_tile(color = "white") + scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0, limit = c(-1,1), space = "Lab", name="Correlation") + geom_text(aes(label = value), color = "black", size = 4) + labs(title = "Correlation Heatmap between Variables of Interest", x = "", y = "") + theme_minimal() + theme(plot.title = element_text(size = 12, hjust = 0.5)) + coord_fixed()
+month_labels <- c("Jan", "Apr", "Jul", "Oct")
+monthly_precip_by_month <- cocoa_data %>% mutate(Month = month(YearMonth, label = TRUE, abbr = TRUE)) %>% group_by(Month) %>% summarise(avg_precip = mean(PRCP, na.rm = TRUE))
+p1 <- ggplot(monthly_precip_by_month, aes(x = Month, y = avg_precip, group = 1)) + geom_line(color = "cornflowerblue") + geom_point(size = 2) + labs(title = "Avgerage Monthly Precipitation", x = "Month", y = "Precipitation (inches)") + scale_x_discrete(breaks = month_labels) + theme_minimal() + theme(plot.title = element_text(hjust = 0.5, size = 12))
+p2 <- ggplot(cocoa_data, aes(x = factor(month(YearMonth, label = TRUE)), y = TAVG)) + geom_boxplot(fill = "steelblue") + labs(title = "Avgerage Monthly Temperature", x = "Month", y = "TAVG (°F)") + scale_x_discrete(breaks = month_labels) + theme_minimal() + theme(plot.title = element_text(hjust = 0.5, size = 12))
+p1 + p2
+cocoa_long <- cocoa_data %>% mutate(Price_GHS = Price * currency) %>% select(YearMonth, Price, Price_GHS) %>% rename(USD = Price, GHS = Price_GHS) %>% pivot_longer(cols = c("USD", "GHS"), names_to = "Currency", values_to = "Price")
+ggplot(cocoa_long, aes(x = YearMonth, y = Price, color = Currency, linetype = Currency)) + geom_line() + facet_wrap(~Currency, scales = "free_y", ncol = 1) + labs(title = "Cocoa Price in USD vs GHS (Monthly)", x = "Date", y = "Price per tonne", color = "Currency", linetype = "Currency") + theme_minimal() + theme(legend.position = "bottom", plot.title = element_text(hjust = 0.5))
+start_year <- as.numeric(substr(start(ts_train), 1, 4))
+start_month <- as.numeric(substr(start(ts_train), 6, 7))
+ts_train_ts <- ts(as.numeric(ts_train), start = c(start_year, start_month), frequency = 12)
+decomp <- stl(ts_train_ts, s.window = "periodic")
+plot(decomp, main = "Time Series Decomposition of Monthly Cocoa Price (1994–2025)", cex.main = 3)
+fit_ets <- ets(ts_train)
+summary(fit_ets)
+forecast_ets <- forecast(fit_ets, h = length(ts_test))
+preds <- as.numeric(forecast_ets$mean)
+actuals <- as.numeric(ts_test)
+rmse_ets <- sqrt(mean((preds - actuals)^2))
+adf.test(ts_train)
+log_ts <- log(ts_train)
+log_ts_test <- log(ts_test)
+adf.test(log_ts)
+adf.test(na.omit(diff(log_ts)))
+adf_results <- data.frame(Data = c("Original Price Time Series", "Log-Transformed Price Time Series", "First-Order Differenced Log-Transformed Price Time Series"),`p-value` = c(0.6311, 0.2119, 0.01),`Conclusion` = c("Not Stationary", "Not Stationary", "Stationary"))
+kable(adf_results, caption = "Augmented Dickey-Fuller Test Results for Time Series Model")
+acf2(diff(log_ts))
+fit_arima <- auto.arima(log_ts, seasonal = FALSE)
+forecast_arima <- forecast(fit_arima, h = length(log_ts_test))
+summary(fit_arima)
+forecast_arima_exp <- exp(forecast_arima$mean)
+rmse_arima <- sqrt(mean((forecast_arima_exp - ts_test)^2, na.rm = TRUE))
+fit_sarima <- auto.arima(log_ts, seasonal = TRUE)
+forecast_sarima <- forecast(fit_sarima, h = length(log_ts_test))
+forecast_sarima_exp <- exp(forecast_sarima$mean)
+summary(fit_sarima)
+rmse_sarima <- sqrt(mean((forecast_sarima_exp - ts_test)^2, na.rm = TRUE))
+residuals_arima <- residuals(fit_arima)
+checkresiduals(fit_arima)
+arima_mean <- forecast_arima$mean
+spec <- ugarchspec(variance.model = list(model = "sGARCH", garchOrder = c(1,1)),
+  mean.model = list(armaOrder = c(0,0), include.mean = FALSE), distribution.model = "norm")
+garch_fit <- ugarchfit(spec, data = residuals_arima)
+garch_forecast <- ugarchforecast(garch_fit, n.ahead = length(ts_test))
+garch_sd <- sigma(garch_forecast)
+forecast_point_nat <- exp(arima_mean + 0.5 * (garch_sd)^2)
+lower_95_nat <- exp(arima_mean - 1.96 * garch_sd)
+upper_95_nat <- exp(arima_mean + 1.96 * garch_sd)
+lower_80_nat <- exp(arima_mean - 1.28 * garch_sd)
+upper_80_nat <- exp(arima_mean + 1.28 * garch_sd)
+rmse_garch <- sqrt(mean((forecast_point_nat - ts_test)^2, na.rm = TRUE))
+hist_df_nat <- tibble(Date = as.Date(as.yearmon(time(ts_train))),Price = as.numeric(ts_train))
+last_train_point <- tail(hist_df_nat, 1)
+plot_df_nat <- tibble(Date = as.Date(as.yearmon(time(ts_test))),
+  Forecast = as.numeric(forecast_point_nat),
+  Upper_95 = as.numeric(upper_95_nat),
+  Lower_95 = as.numeric(lower_95_nat),
+  Upper_80 = as.numeric(upper_80_nat),
+  Lower_80 = as.numeric(lower_80_nat))
+plot_df_nat_continuous <- bind_rows(last_train_point, plot_df_nat)
+plot_df_nat_continuous$Forecast[1] <- 6583
+test_df_nat <- tibble(Date = as.Date(as.yearmon(time(ts_test))),Price = as.numeric(ts_test))
+test_df_nat_continuous <- bind_rows(last_train_point, test_df_nat)
+hist_df_nat <- hist_df_nat %>% filter(Date >= as.Date("2020-01-01"))
+ggplot() +
+  geom_line(data = hist_df_nat, aes(x = Date, y = Price), color = "grey40") +
+  geom_line(data = test_df_nat_continuous, aes(x = Date, y = Price), color = "black", size = 0.6) +
+  geom_ribbon(data = plot_df_nat, aes(x = Date, ymin = Lower_95, ymax = Upper_95),
+              fill = "blue", alpha = 0.2) +
+  geom_ribbon(data = plot_df_nat, aes(x = Date, ymin = Lower_80, ymax = Upper_80),
+              fill = "blue", alpha = 0.4) +
+  geom_line(data = plot_df_nat_continuous, aes(x = Date, y = Forecast), color = "red", linewidth = 0.6) +
+  labs(title = "ARIMA + GARCH Forecast (Natural Scale)",
+       x = "Date", y = "Price") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+adf.test(train_data$Price)
+adf.test(train_data$logPrice)
+adf.test(train_data$difflogPrice)
+adf.test(train_data$currency)
+adf.test(train_data$logcurrency)
+adf.test(train_data$difflogcurrency)
+adf.test(train_data$PRCP)
+adf.test(train_data$logPRCP)
+adf.test(train_data$difflogPRCP)
+adf.test(train_data$TAVG)
+adf.test(train_data$logTAVG)
+adf.test(train_data$difflogTAVG)
+adf_results <- data.frame(Data = c("First-Order Differenced Log-Transformed Price Time Series", "First-Order Differenced Log-Transformed Exchange Rate Time Series", "Precipitation", "Temperature"),`p-value` = c(0.01, 0.01, 0.01, 0.01),`Conclusion` = c("Stationary", "Stationary", "Stationary", "Stationary"))
+kable(adf_results, caption = "Augmented Dickey-Fuller Test Results for Regression Model")
+mlr_model <- lm(difflogPrice ~ difflogcurrency + TAVG + PRCP, data = train_data)
+mlr_model_4 <- lm(difflogPrice ~ TAVG + difflogcurrency, data = train_data)
+mlr_model_4_residuals <- residuals(mlr_model_4)
+ljung_box_test <- Box.test(mlr_model_4_residuals, lag = 20, type = "Ljung-Box")
+ljung_box_p_value <- round(ljung_box_test$p.value, 4)
+model_results <- data.frame(Model = c("MLR 1 (currency + TAVG + PRCP)", "", "", "MLR 2 (TAVG + currency)", ""), AIC = c("-966.1486", "", "", "-967.4611", ""), Variable = c("TAVG", "difflogcurrency", "PRCP", "TAVG", "difflogcurrency"), VIF = c("", "", "", "1.000053", "1.000053"), Ljung_Box_P_Value = c("", "", "", ljung_box_p_value, ""))
+kable(model_results, caption = "Model Comparison with AIC, VIF, and Ljung-Box Test")
+par(mfrow = c(2, 2))
+plot(mlr_model_2)
+xreg <- as.matrix(train_data[, c("TAVG", "difflogcurrency")])
+arimax_model <- auto.arima(train_data$difflogPrice, xreg = xreg, seasonal = FALSE, trace = TRUE)
+xreg_future <- as.matrix(test_data[, c("TAVG", "difflogcurrency")])
+arimax_forecast <- forecast(arimax_model, xreg = xreg_future, h = nrow(test_data))
+last_price <- tail(train_data$Price, 1)  # Last actual price from the training data
+forecasted_diff_log <- arimax_forecast$mean
+raw_forecasted <- last_price * exp(cumsum(forecasted_diff_log))
+raw_actual <- last_price * exp(cumsum(test_data$difflogPrice))
+forecast_results <- data.frame(Time = 1:length(raw_actual),Actual = raw_actual,Forecast = raw_forecasted)
+accuracy_metrics_arima<-data.frame(ME=mean(forecast_results$Actual-forecast_results$Forecast,na.rm=TRUE),RMSE=sqrt(mean((forecast_results$Actual-forecast_results$Forecast)^2,na.rm=TRUE)),MAE=mean(abs(forecast_results$Actual-forecast_results$Forecast),na.rm=TRUE),MAPE=mean(abs((forecast_results$Actual-forecast_results$Forecast)/forecast_results$Actual),na.rm=TRUE)*100)
+arimax_residuals <- residuals(arimax_model)
+plot(arimax_residuals,type="l",col="blue",main="Residuals from ARIMAX Model",xlab="Time",ylab="Residuals")
+abline(h = 0, col = "red", lty = 2)
+ljung_box_test <- Box.test(arimax_residuals, lag = 20, type = "Ljung-Box")
+print("Ljung-Box Test for Residual Independence:")
+print(ljung_box_test)
+train_data_ts <- xts(train_data$difflogPrice, order.by = as.Date(paste0(train_data$YearMonth, "-01")))
+spec_arimax_garch <- ugarchspec(variance.model = list(model = "sGARCH", garchOrder = c(3, 13)), mean.model = list(armaOrder = c(0, 1), include.mean = TRUE, external.regressors = as.matrix(train_data[, c("TAVG", "difflogcurrency")])), distribution.model = "norm")
+fit_arimax_garch <- ugarchfit(spec = spec_arimax_garch, data = train_data_ts)
+xreg_future <- as.matrix(test_data[, c("TAVG", "difflogcurrency")])
+garch_forecast <- ugarchforecast(fit_arimax_garch, n.ahead = nrow(test_data), external.forecasts = list(mregfor = xreg_future))
+forecasted_mean <- fitted(garch_forecast)
+forecasted_sigma <- sigma(garch_forecast)
+last_price <- tail(train_data$Price, 1)
+raw_forecasted <- last_price * exp(cumsum(as.numeric(forecasted_mean)))
+raw_actual <- last_price * exp(cumsum(as.numeric(test_data$difflogPrice)))
+forecast_dates <- seq.Date(from = as.Date(paste0(tail(train_data$YearMonth, 1), "-01")), by = "month", length.out = nrow(test_data))
+train_dates <- as.Date(paste0(train_data$YearMonth, "-01"))
+forecast_results <- data.frame(Time = c(train_dates, forecast_dates), Actual = c(train_data$Price, raw_actual), Forecast = c(rep(NA, length(train_data$Price)), raw_forecasted))
+forecast_results$Lower_95 <- forecast_results$Forecast - 1.96 * c(rep(NA, length(train_data$Price)), forecasted_sigma)
+forecast_results$Upper_95 <- forecast_results$Forecast + 1.96 * c(rep(NA, length(train_data$Price)), forecasted_sigma)
+forecast_results$Lower_80 <- forecast_results$Forecast - 1.28 * c(rep(NA, length(train_data$Price)), forecasted_sigma)
+forecast_results$Upper_80 <- forecast_results$Forecast + 1.28 * c(rep(NA, length(train_data$Price)), forecasted_sigma)
+forecast_results$Label <- c(rep("Training Data", length(train_data$Price)), rep("Test Data", length(raw_actual)))
+forecast_results <- forecast_results %>% filter(Time >= as.Date("2020-01-01"))
+train_tail_point <- tail(forecast_results[forecast_results$Label == "Training Data", ], 1)
+test_df_continuous <- bind_rows(train_tail_point, forecast_results[forecast_results$Label == "Test Data", ])
+forecast_df_continuous <- forecast_results[, c("Time", "Forecast", "Upper_95", "Lower_95", "Upper_80", "Lower_80")]
+first_forecast_idx <- which(!is.na(forecast_df_continuous$Forecast))[1]
+forecast_idx <- which(!is.na(forecast_df_continuous$Forecast))
+if (length(forecasted_sigma) != length(forecast_idx)) {
+  stop("Length of forecasted_sigma does not match forecast horizon.")}
+forecast_df_continuous$Lower_95[forecast_idx] <- exp(log(forecast_df_continuous$Forecast[forecast_idx]) - 1.96 * forecasted_sigma)
+forecast_df_continuous$Upper_95[forecast_idx] <- exp(log(forecast_df_continuous$Forecast[forecast_idx]) + 1.96 * forecasted_sigma)
+forecast_df_continuous$Lower_80[forecast_idx] <- exp(log(forecast_df_continuous$Forecast[forecast_idx]) - 1.28 * forecasted_sigma)
+forecast_df_continuous$Upper_80[forecast_idx] <- exp(log(forecast_df_continuous$Forecast[forecast_idx]) + 1.28 * forecasted_sigma)
+ggplot() + geom_line(data = forecast_results %>% filter(Label == "Training Data"), aes(x = Time, y = Actual), color = "grey40", size = 0.6) + geom_line(data = test_df_continuous, aes(x = Time, y = Actual), color = "black", size = 0.6) + geom_ribbon(data = forecast_df_continuous, aes(x = Time, ymin = Lower_95, ymax = Upper_95), fill = "blue", alpha = 0.2) + geom_ribbon(data = forecast_df_continuous, aes(x = Time, ymin = Lower_80, ymax = Upper_80), fill = "blue", alpha = 0.4) + geom_line(data = forecast_df_continuous, aes(x = Time, y = Forecast), color = "red", linewidth = 0.6) + labs(title = "ARIMAX-GARCH Forecast (Natural Scale)", x = "Date", y = "Price") + theme_minimal() + theme(plot.title = element_text(hjust = 0.5))
+accuracy_metrics_arima_garch <- data.frame(ME = mean(forecast_results$Actual - forecast_results$Forecast, na.rm = TRUE), RMSE = sqrt(mean((forecast_results$Actual - forecast_results$Forecast)^2, na.rm = TRUE)), MAE = mean(abs(forecast_results$Actual - forecast_results$Forecast), na.rm = TRUE), MAPE = mean(abs((forecast_results$Actual - forecast_results$Forecast) / forecast_results$Actual), na.rm = TRUE) * 100)
+residuals_garch <- residuals(fit_arimax_garch, standardize = TRUE)
+plot(as.ts(residuals_garch), type = "l", col = "blue", main = "Residuals from ARIMAX-GARCH Model", xlab = "Time", ylab = "Residuals") abline(h = 0, col = "red", lty = 2)
+jarque_bera <- jarque.bera.test(residuals_garch)
+print(jarque_bera)
+model_results <- data.frame(Model = c("ETS", "ARIMA", "SARIMA", "ARIMA + GARCH", "ARIMAX", "SARIMAX", "ARIMAX + GARCH"),RMSE = c(rmse_ets, rmse_arima, rmse_sarima, rmse_garch, accuracy_metrics_arima$RMSE, accuracy_metrics_sarima$RMSE, accuracy_metrics_arima_garch$RMSE))
+kable(model_results, caption = "**Model Comparison: RMSE**")
+```
